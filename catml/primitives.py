@@ -189,22 +189,79 @@ def sum_all(x):
     return bind(prim, x)
 
 
-def linear(x, out_dim: int, rng: np.random.Generator, tag: str | None = None):
-    """Apply an affine transformation with freshly initialized parameters.
+def attention(q, k, v):
+    """Apply scaled dot-product attention.
 
     Args:
-        x: Input vector.
-        out_dim: Output dimension.
+        q: Query matrix of shape (seq_len, d_model).
+        k: Key matrix of shape (seq_len, d_model).
+        v: Value matrix of shape (seq_len, d_model).
+
+    Returns:
+        Attention output of shape (seq_len, d_model).
+    """
+    def eval_fn(args: tuple[np.ndarray, ...], params: dict[str, np.ndarray]) -> np.ndarray:
+        q_val, k_val, v_val = args
+        d_model = q_val.shape[-1]
+        scale = 1.0 / np.sqrt(d_model)
+        scores = (q_val @ k_val.swapaxes(-1, -2)) * scale
+        scores_max = np.max(scores, axis=-1, keepdims=True)
+        exp_scores = np.exp(scores - scores_max)
+        weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+        return weights @ v_val
+
+    def pullback_fn(
+        args: tuple[np.ndarray, ...],
+        params: dict[str, np.ndarray],
+        out_grad: np.ndarray,
+        out: np.ndarray,
+    ) -> tuple[tuple[np.ndarray, ...], dict[str, np.ndarray]]:
+        q_val, k_val, v_val = args
+        d_model = q_val.shape[-1]
+        scale = 1.0 / np.sqrt(d_model)
+        scores = (q_val @ k_val.swapaxes(-1, -2)) * scale
+        scores_max = np.max(scores, axis=-1, keepdims=True)
+        exp_scores = np.exp(scores - scores_max)
+        weights = exp_scores / np.sum(exp_scores, axis=-1, keepdims=True)
+
+        dv = weights.swapaxes(-1, -2) @ out_grad
+        dweights = out_grad @ v_val.swapaxes(-1, -2)
+        dscores = dweights * weights
+        dscores -= weights * np.sum(dweights * weights, axis=-1, keepdims=True)
+        dscores *= scale
+        dq = dscores @ k_val
+        dk = dscores.swapaxes(-1, -2) @ q_val
+        return (dq, dk, dv), {}
+
+    def shape_fn(input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
+        return input_shapes[2]
+
+    prim = Primitive(
+        name="attention",
+        eval_fn=eval_fn,
+        pullback_fn=pullback_fn,
+        shape_fn=shape_fn,
+        param_count_fn=lambda params: 0,
+    )
+    return bind(prim, q, k, v)
+
+
+def linear(x, out_dim: int, rng: np.random.Generator, tag: str | None = None):
+    """Apply an affine transformation over the last dimension.
+
+    Args:
+        x: Input array with last dimension representing features.
+        out_dim: Output feature dimension.
         rng: NumPy random generator for parameter initialization.
         tag: Optional label for grouping parameter gradients.
 
     Returns:
-        Output vector of shape `(out_dim,)`.
+        Output array with the same leading dimensions and last dimension `out_dim`.
 
     Raises:
         ValueError: If the input shape cannot be inferred.
     """
-    in_dim = _shape_of(x)[0]
+    in_dim = _shape_of(x)[-1]
     scale = 1.0 / np.sqrt(in_dim)
     params = {
         "W": rng.standard_normal((out_dim, in_dim)) * scale,
@@ -212,7 +269,8 @@ def linear(x, out_dim: int, rng: np.random.Generator, tag: str | None = None):
     }
 
     def eval_fn(args: tuple[np.ndarray, ...], params: dict[str, np.ndarray]) -> np.ndarray:
-        return params["W"] @ args[0] + params["b"]
+        x_val = args[0]
+        return x_val @ params["W"].T + params["b"]
 
     def pullback_fn(
         args: tuple[np.ndarray, ...],
@@ -221,13 +279,15 @@ def linear(x, out_dim: int, rng: np.random.Generator, tag: str | None = None):
         out: np.ndarray,
     ) -> tuple[tuple[np.ndarray, ...], dict[str, np.ndarray]]:
         x_val = args[0]
-        dW = np.outer(out_grad, x_val)
-        db = out_grad
-        dx = params["W"].T @ out_grad
+        x_flat = x_val.reshape(-1, x_val.shape[-1])
+        grad_flat = out_grad.reshape(-1, out_grad.shape[-1])
+        dW = grad_flat.T @ x_flat
+        db = np.sum(grad_flat, axis=0)
+        dx = out_grad @ params["W"]
         return (dx,), {"W": dW, "b": db}
 
     def shape_fn(input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
-        return (out_dim,)
+        return (*input_shapes[0][:-1], out_dim)
 
     prim = Primitive(
         name="linear",
@@ -239,36 +299,36 @@ def linear(x, out_dim: int, rng: np.random.Generator, tag: str | None = None):
     return bind(prim, x, params=params, tag=tag)
 
 
-def linear_relu(x, out_dim: int, rng: np.random.Generator, tag: str | None = None):
-    """Apply an affine transformation followed by ReLU.
+def layer_norm(
+    x,
+    rng: np.random.Generator,
+    eps: float = 1e-5,
+    tag: str | None = None,
+):
+    """Apply layer normalization over the last dimension.
 
     Args:
-        x: Input vector.
-        out_dim: Output dimension.
+        x: Input array.
         rng: NumPy random generator for parameter initialization.
+        eps: Numerical stability constant.
         tag: Optional label for grouping parameter gradients.
 
     Returns:
-        ReLU-activated output vector of shape `(out_dim,)`.
-
-    Raises:
-        ValueError: If the input shape cannot be inferred.
+        Layer-normalized output with the same shape as `x`.
     """
-    in_dim = _shape_of(x)[0]
-    scale = 1.0 / np.sqrt(in_dim)
+    in_dim = _shape_of(x)[-1]
     params = {
-        "W": rng.standard_normal((out_dim, in_dim)) * scale,
-        "b": np.zeros((out_dim,)),
+        "gamma": np.ones((in_dim,)),
+        "beta": np.zeros((in_dim,)),
     }
-    prim = linear_relu_prim(out_dim)
-    return bind(prim, x, params=params, tag=tag)
 
-
-def linear_relu_prim(out_dim: int) -> Primitive:
-    """Construct a fused linear + ReLU primitive for a fixed output dimension."""
     def eval_fn(args: tuple[np.ndarray, ...], params: dict[str, np.ndarray]) -> np.ndarray:
-        z = params["W"] @ args[0] + params["b"]
-        return np.maximum(0.0, z)
+        x_val = args[0]
+        mean = np.mean(x_val, axis=-1, keepdims=True)
+        var = np.mean((x_val - mean) ** 2, axis=-1, keepdims=True)
+        inv_std = 1.0 / np.sqrt(var + eps)
+        x_hat = (x_val - mean) * inv_std
+        return x_hat * params["gamma"] + params["beta"]
 
     def pullback_fn(
         args: tuple[np.ndarray, ...],
@@ -277,22 +337,32 @@ def linear_relu_prim(out_dim: int) -> Primitive:
         out: np.ndarray,
     ) -> tuple[tuple[np.ndarray, ...], dict[str, np.ndarray]]:
         x_val = args[0]
-        dz = out_grad * (out > 0)
-        dW = np.outer(dz, x_val)
-        db = dz
-        dx = params["W"].T @ dz
-        return (dx,), {"W": dW, "b": db}
+        mean = np.mean(x_val, axis=-1, keepdims=True)
+        var = np.mean((x_val - mean) ** 2, axis=-1, keepdims=True)
+        inv_std = 1.0 / np.sqrt(var + eps)
+        x_hat = (x_val - mean) * inv_std
+
+        axes = tuple(range(x_val.ndim - 1))
+        dgamma = np.sum(out_grad * x_hat, axis=axes)
+        dbeta = np.sum(out_grad, axis=axes)
+
+        dx_hat = out_grad * params["gamma"]
+        dmean = np.mean(dx_hat, axis=-1, keepdims=True)
+        dmean_xhat = np.mean(dx_hat * x_hat, axis=-1, keepdims=True)
+        dx = inv_std * (dx_hat - dmean - x_hat * dmean_xhat)
+        return (dx,), {"gamma": dgamma, "beta": dbeta}
 
     def shape_fn(input_shapes: list[tuple[int, ...]]) -> tuple[int, ...]:
-        return (out_dim,)
+        return input_shapes[0]
 
-    return Primitive(
-        name="linear_relu",
+    prim = Primitive(
+        name="layer_norm",
         eval_fn=eval_fn,
         pullback_fn=pullback_fn,
         shape_fn=shape_fn,
         param_count_fn=lambda params: int(sum(np.prod(p.shape) for p in params.values())),
     )
+    return bind(prim, x, params=params, tag=tag)
 
 
 def _shape_of(x) -> tuple[int, ...]:
