@@ -110,6 +110,25 @@ def grad_program(program: Program, inputs: tuple[Any, ...], out_grad: Any) -> tu
     Raises:
         ValueError: If input or output structures do not match the program.
     """
+    primal, _, param_grads = pullback_program(program, inputs, out_grad)
+    return primal, param_grads
+
+
+def pullback_program(
+    program: Program,
+    inputs: tuple[Any, ...],
+    out_grad: Any,
+) -> tuple[Any, tuple[Any, ...], dict[str, dict[str, np.ndarray]]]:
+    """Run reverse-mode autodiff and return primal, input grads, and parameter grads.
+
+    Args:
+        program: Traced program IR.
+        inputs: Numeric inputs matching the program input structure.
+        out_grad: Output cotangent matching the program output structure.
+
+    Returns:
+        Tuple of (primal output, input gradients, parameter gradients).
+    """
     flat_inputs = _flatten_inputs(inputs, program.input_treedefs)
     env: dict[int, Any] = {}
     for var, value in zip(program.inputs, flat_inputs):
@@ -142,14 +161,24 @@ def grad_program(program: Program, inputs: tuple[Any, ...], out_grad: Any) -> tu
                 grad_env[ident] = grad
         if instr.tag is not None and pgrads:
             if instr.tag not in param_grads:
-                param_grads[instr.tag] = {k: v.copy() for k, v in pgrads.items()}
+                param_grads[instr.tag] = {key: value.copy() for key, value in pgrads.items()}
             else:
                 for key, value in pgrads.items():
                     if key in param_grads[instr.tag]:
                         param_grads[instr.tag][key] = param_grads[instr.tag][key] + value
                     else:
                         param_grads[instr.tag][key] = value.copy()
-    return primal, param_grads
+
+    input_grads = []
+    cursor = 0
+    for treedef in program.input_treedefs:
+        leaf_count = _count_leaves(treedef)
+        grads = []
+        for var in program.inputs[cursor : cursor + leaf_count]:
+            grads.append(grad_env.get(var.ident))
+        input_grads.append(unflatten_tree(grads, treedef))
+        cursor += leaf_count
+    return primal, tuple(input_grads), param_grads
 
 
 def _flatten_inputs(inputs: tuple[Any, ...], treedefs: tuple[TreeDef, ...]) -> list[Any]:
@@ -169,3 +198,9 @@ def _flatten_output_grads(out_grad: Any, treedef: TreeDef) -> list[Any]:
     if actual != treedef:
         raise ValueError("Output gradient structure mismatch")
     return leaves
+
+
+def _count_leaves(treedef: TreeDef) -> int:
+    if treedef.kind == "leaf":
+        return 1
+    return sum(_count_leaves(child) for child in treedef.children)
