@@ -144,8 +144,6 @@ loss, h_grads, f_grads, g_grads = triangle_gradients(
 )
 ```
 
-This is the main “CT-flavored” payoff of the framework: once programs are first-class maps, losses can be defined over paths and commuting diagrams, not only over single forward passes.
-
 ## Quick start
 
 ```bash
